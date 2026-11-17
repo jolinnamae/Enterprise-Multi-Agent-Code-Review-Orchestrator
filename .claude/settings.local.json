@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build:*)",
+      "Bash(npm test:*)",
+      "Bash(npm run dev:*)",
+      "Bash(env)",
+      "Bash(npm install:*)",
+      "Bash(claude-code:*)",
+      "Bash(claude --version:*)",
+      "Bash(tsx src/main.ts:*)",
+      "Bash(node src/main.ts:*)",
+      "Bash(node dist/main.js:*)"
+    ]
+  }
+}
