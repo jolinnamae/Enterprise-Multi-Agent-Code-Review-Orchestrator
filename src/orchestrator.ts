@@ -1,9 +1,9 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { ReviewReport, ReviewReportSchema } from './types/report-types.js';
 import { buildOrchestratorPrompt } from './prompts/orchestrator.prompt.js';
 import { codeQualityAnalyzer, testCoverageAnalyzer, refactoringSuggester } from './agents/index.js';
 import { mcpServersConfig } from './config/mcp.config.js';
-import { ReviewReportJSONSchema } from './types/index.js';
 
 /**
  * Orchestrator configuration options
@@ -36,111 +36,68 @@ export class CodeReviewOrchestrator {
   ): Promise<ReviewReport> {
     const startTime = Date.now();
 
-    // Build a mock report for testing
-    const mockReport: ReviewReport = {
-      pullRequest: {
-        owner,
-        repo,
-        number: prNumber
-      },
-      fileReviews: [
-        {
-          file: 'src/index.ts',
-          codeQuality: {
-            file: 'src/index.ts',
-            issues: [
-              {
-                line: 10,
-                severity: 'medium',
-                category: 'best-practice',
-                description: 'Consider using const for variables that are not reassigned',
-                suggestion: 'Replace let with const'
-              }
-            ],
-            overallScore: 85,
-            summary: 'Generally good code quality with minor suggestions'
-          },
-          testCoverage: {
-            file: 'src/index.ts',
-            hasTests: true,
-            testFiles: ['src/index.test.ts'],
-            untestedPaths: [
-              {
-                type: 'function',
-                location: 'calculateTotal at line 15',
-                priority: 'high',
-                reasoning: 'Critical utility function',
-                suggestedTest: 'it("should calculate total", () => { expect(calculateTotal([1,2,3])).toBe(6); })'
-              }
-            ],
-            coverageEstimate: 75,
-            summary: 'Good test coverage with some gaps'
-          },
-          refactorings: {
-            file: 'src/index.ts',
-            suggestions: [
-              {
-                type: 'extract-function',
-                location: 'processData at line 20',
-                impact: 'medium',
-                description: 'Extract validation logic into separate function',
-                before: 'if (x < 0 || x > 100) { throw new Error(...) }',
-                after: 'validateRange(x);',
-                benefits: 'Improves readability and reusability'
-              }
-            ],
-            summary: 'One refactoring opportunity identified'
-          }
-        }
-      ],
-      summary: {
-        totalFiles: 1,
-        overallScore: 80,
-        criticalIssues: 0,
-        highPriorityTests: 1,
-        refactoringOpportunities: 1
-      },
-      recommendations: [
-        {
-          priority: 'high',
-          category: 'testing',
-          description: 'Increase test coverage for utility functions',
-          files: ['src/index.ts', 'src/index.test.ts']
-        },
-        {
-          priority: 'medium',
-          category: 'refactoring',
-          description: 'Extract validation logic into separate function',
-          files: ['src/index.ts']
-        }
-      ],
-      metadata: {
-        analyzedAt: new Date().toISOString(),
-        duration: 0,
-        agentVersions: {
-          'code-quality-analyzer': '1.0',
-          'test-coverage-analyzer': '1.0',
-          'refactoring-suggester': '1.0'
-        }
-      }
+    // Create async generator for prompt (required for streaming/MCP compatibility)
+    async function* generateMessages(userMessage: string) {
+      yield {
+        type: 'user' as const,
+        message: { role: 'user' as const, content: userMessage },
+        parent_tool_use_id: null,
+        session_id: 'code-review-orchestrator-session',
+      };
+    }
+
+    // Build orchestrator prompt
+    const userPrompt = buildOrchestratorPrompt(owner, repo, prNumber);
+
+    // Configure output format using ReviewReportSchema with proper $refStrategy
+    // @ts-ignore - zodToJsonSchema has complex type recursion issues with ReviewReportSchema
+    const outputSchema = zodToJsonSchema(ReviewReportSchema, { $refStrategy: 'root' });
+
+    // Define agents for registration
+    const agents: Record<string, typeof codeQualityAnalyzer> = {
+      'code-quality-analyzer': codeQualityAnalyzer,
+      'test-coverage-analyzer': testCoverageAnalyzer,
+      'refactoring-suggester': refactoringSuggester
     };
 
-    // Validate against schema
-    const validation = ReviewReportSchema.safeParse(mockReport);
-    if (!validation.success) {
-      throw new Error(
-        `Invalid review report structure: ${validation.error.message}`
-      );
+    // Call query with proper SDK configuration
+    for await (const message of query({
+      prompt: generateMessages(userPrompt),
+      options: {
+        model: this.model,
+        mcpServers: mcpServersConfig,
+        allowedTools: ['Task', 'mcp__github__*', 'mcp__eslint__*'],
+        agents: agents as Record<string, any>,
+        outputFormat: {
+          type: 'json_schema',
+          schema: outputSchema,
+        },
+      },
+    })) {
+      // Handle successful structured output result
+      if (message.type === 'result' && (message as any).subtype === 'success' && (message as any).structured_output) {
+        // Validate against schema
+        const validation = ReviewReportSchema.safeParse((message as any).structured_output);
+        if (!validation.success) {
+          throw new Error(
+            `Invalid review report structure from query: ${validation.error.message}`
+          );
+        }
+
+        // Calculate and set duration
+        const duration = Date.now() - startTime;
+        validation.data.metadata.duration = duration;
+
+        return validation.data;
+      }
+
+      // Handle error results
+      if (message.type === 'result' && (message as any).subtype !== 'success') {
+        throw new Error(`Query failed: ${(message as any).subtype}`);
+      }
     }
 
-    // Calculate duration
-    const duration = Date.now() - startTime;
-
-    // Ensure metadata has the duration
-    if (validation.data.metadata) {
-      validation.data.metadata.duration = duration;
-    }
-
-    return validation.data;
+    // If we exit the loop without returning, we got no structured output
+    throw new Error('Query produced no structured output from orchestration agent');
   }
 }

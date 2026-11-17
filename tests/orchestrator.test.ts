@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   CodeQualityResultSchema,
   TestCoverageResultSchema,
@@ -11,6 +11,9 @@ import {
 } from '../src/types/index.js';
 import { withRetry, withTimeout, ReviewError, ErrorCodes } from '../src/utils/index.js';
 import { RateLimiter } from '../src/utils/index.js';
+
+// Mock the SDK before importing the orchestrator
+vi.mock('@anthropic-ai/claude-agent-sdk');
 
 describe('Type Schemas and Validation', () => {
   describe('CodeQualityResult schema', () => {
@@ -436,5 +439,169 @@ describe('Production Utilities', () => {
       limiter.release();
       expect(limiter.canProceed(100)).toBe(true);
     });
+  });
+});
+
+describe('CodeReviewOrchestrator', () => {
+  it('should call query() with proper configuration', async () => {
+    // Import after mock is defined
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const { CodeReviewOrchestrator } = await import('../src/orchestrator.js');
+
+    // Create a valid mock structured output
+    const mockStructuredOutput = {
+      pullRequest: {
+        owner: 'testowner',
+        repo: 'testrepo',
+        number: 42
+      },
+      fileReviews: [
+        {
+          file: 'src/test.ts',
+          codeQuality: {
+            file: 'src/test.ts',
+            issues: [],
+            overallScore: 90,
+            summary: 'Good code quality'
+          },
+          testCoverage: {
+            file: 'src/test.ts',
+            hasTests: true,
+            testFiles: ['src/test.test.ts'],
+            untestedPaths: [],
+            coverageEstimate: 95,
+            summary: 'Well tested'
+          },
+          refactorings: {
+            file: 'src/test.ts',
+            suggestions: [],
+            summary: 'No refactoring needed'
+          }
+        }
+      ],
+      summary: {
+        totalFiles: 1,
+        overallScore: 90,
+        criticalIssues: 0,
+        highPriorityTests: 0,
+        refactoringOpportunities: 0
+      },
+      recommendations: [],
+      metadata: {
+        analyzedAt: new Date().toISOString(),
+        duration: 1000,
+        agentVersions: {
+          'code-quality-analyzer': '1.0',
+          'test-coverage-analyzer': '1.0',
+          'refactoring-suggester': '1.0'
+        }
+      }
+    };
+
+    // Create an async iterator that yields a result event with structured output
+    const mockAsyncIterator = async function* () {
+      yield {
+        type: 'result',
+        subtype: 'success',
+        structured_output: mockStructuredOutput
+      };
+    };
+
+    const queryMock = vi.mocked(query);
+    queryMock.mockReturnValue(mockAsyncIterator());
+
+    // Create orchestrator and call reviewPullRequest
+    process.env.ANTHROPIC_MODEL = 'claude-test-model';
+    const orchestrator = new CodeReviewOrchestrator();
+    const report = await orchestrator.reviewPullRequest('testowner', 'testrepo', 42);
+
+    // Verify query was called
+    expect(queryMock).toHaveBeenCalledOnce();
+
+    // Get the call arguments
+    const callArgs = queryMock.mock.calls[0][0];
+
+    // Verify the prompt is a generator (not a string)
+    expect(callArgs.prompt).toBeDefined();
+    expect(typeof callArgs.prompt[Symbol.asyncIterator]).toBe('function');
+
+    // Verify options are passed correctly
+    expect(callArgs.options).toBeDefined();
+    const options = callArgs.options as Record<string, any>;
+
+    // Verify mcpServersConfig is passed
+    expect(options.mcpServers).toBeDefined();
+    expect(options.mcpServers).toHaveProperty('github');
+    expect(options.mcpServers).toHaveProperty('eslint');
+
+    // Verify Task is in allowedTools
+    expect(options.allowedTools).toContain('Task');
+
+    // Verify all three agents are registered
+    expect(options.agents).toBeDefined();
+    expect(options.agents).toHaveProperty('code-quality-analyzer');
+    expect(options.agents).toHaveProperty('test-coverage-analyzer');
+    expect(options.agents).toHaveProperty('refactoring-suggester');
+
+    // Verify outputFormat is configured
+    expect(options.outputFormat).toBeDefined();
+    expect(options.outputFormat.type).toBe('json_schema');
+    expect(options.outputFormat.schema).toBeDefined();
+
+    // Verify the report is validated and returned
+    expect(report).toBeDefined();
+    expect(report.pullRequest.owner).toBe('testowner');
+    expect(report.pullRequest.repo).toBe('testrepo');
+    expect(report.pullRequest.number).toBe(42);
+
+    // Verify schema validation passed
+    const schemaCheck = ReviewReportSchema.safeParse(report);
+    expect(schemaCheck.success).toBe(true);
+  });
+
+  it('should throw error if query produces no structured output', async () => {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const { CodeReviewOrchestrator } = await import('../src/orchestrator.js');
+
+    // Create an async iterator that yields no result event with success subtype
+    const mockAsyncIterator = async function* () {
+      yield { type: 'assistant' };
+    };
+
+    const queryMock = vi.mocked(query);
+    queryMock.mockReturnValue(mockAsyncIterator());
+
+    process.env.ANTHROPIC_MODEL = 'claude-test-model';
+    const orchestrator = new CodeReviewOrchestrator();
+
+    await expect(
+      orchestrator.reviewPullRequest('owner', 'repo', 1)
+    ).rejects.toThrow('Query produced no structured output');
+  });
+
+  it('should throw error if structured output is invalid', async () => {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    const { CodeReviewOrchestrator } = await import('../src/orchestrator.js');
+
+    // Create an async iterator with invalid structured output
+    const mockAsyncIterator = async function* () {
+      yield {
+        type: 'result',
+        subtype: 'success',
+        structured_output: {
+          pullRequest: { owner: 'o', repo: 'r' } // Missing required fields
+        }
+      };
+    };
+
+    const queryMock = vi.mocked(query);
+    queryMock.mockReturnValue(mockAsyncIterator());
+
+    process.env.ANTHROPIC_MODEL = 'claude-test-model';
+    const orchestrator = new CodeReviewOrchestrator();
+
+    await expect(
+      orchestrator.reviewPullRequest('owner', 'repo', 1)
+    ).rejects.toThrow('Invalid review report structure from query');
   });
 });
